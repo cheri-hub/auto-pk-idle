@@ -13,6 +13,7 @@
   const PAUSA_FALHA_MS = 15000;   // espera antes de tentar comprar de novo após uma falha
   const RESERVA_OURO = 0;         // ouro que nunca é gasto
   const BOLA_ALVO = 'Great Ball'; // bola usada nas capturas (compra e seleção automáticas)
+  const POCAO_ALVO = 'Hyper Potion'; // poção comprada automaticamente (Small 50 · Great 150 · Ultra 400 · Hyper 800 · Ultimate 1500 ouro)
 
   // O que comprar. 'estoque' devolve a quantidade atual; compra quando < minimo.
   //  atalho: 'max'  -> botão "Máx" do card (gasta quase todo o ouro, até 9999)
@@ -27,10 +28,10 @@
       },
     },
     {
-      nome: 'Small Potion', categoria: 'Poções', atalho: 100, minimo: 50, minLote: 100,
+      nome: POCAO_ALVO, categoria: 'Poções', atalho: 100, minimo: 50, minLote: 100,
       estoque: () => {
-        const q = document.querySelector('#auto-potion-opts .auto-chip[title^="Small Potion"] .q');
-        return q ? { nome: 'Small Potion', qtd: num(q.textContent) } : null;
+        const q = document.querySelector(`#auto-potion-opts .auto-chip[title^="${POCAO_ALVO}"] .q`);
+        return q ? { nome: POCAO_ALVO, qtd: num(q.textContent) } : null;
       },
     },
   ];
@@ -231,7 +232,7 @@
 
   // ---- diagnóstico: corpos que apareceram / receberam bola / sumiram sem bola ----
   const stats = { apareceram: 0, lancados: 0, semBola: 0 };
-  let slotsAnt = new Set();
+  let slotsAnt = new Map();     // slot -> % de tempo restante do corpo
   const clicados = new Map();   // slot -> momento do último clique
   window.pkStats = () => {
     const r = { ...stats, cobertura: stats.apareceram ? Math.round((100 * stats.lancados) / stats.apareceram) + '%' : '-' };
@@ -239,12 +240,19 @@
     return r;
   };
   function rastrear() {
-    const atuais = new Set([...document.querySelectorAll('#caidos-lista button.caido')].map((b) => b.dataset.slot));
-    atuais.forEach((s) => { if (!slotsAnt.has(s)) stats.apareceram++; });
-    slotsAnt.forEach((s) => {
-      if (!atuais.has(s)) {
-        if (clicados.has(s)) clicados.delete(s); else stats.semBola++;
+    const atuais = new Map([...document.querySelectorAll('#caidos-lista button.caido')]
+      .map((b) => [b.dataset.slot, parseFloat(b.querySelector('.caido-tempo i')?.style.width) || 0]));
+    // o jogo reaproveita o slot: corpo novo = slot novo OU tempo restante que voltou a subir
+    atuais.forEach((w, s) => {
+      const p = slotsAnt.get(s);
+      const novo = p === undefined || w > p + 3;
+      if (novo) {
+        stats.apareceram++;
+        if (p !== undefined) { if (clicados.has(s)) clicados.delete(s); else stats.semBola++; } // o antigo foi substituído
       }
+    });
+    slotsAnt.forEach((p, s) => {
+      if (!atuais.has(s)) { if (clicados.has(s)) clicados.delete(s); else stats.semBola++; }
     });
     slotsAnt = atuais;
   }
@@ -268,11 +276,14 @@
     if (!todos.length) return motivoUnico('💤 Nenhum pokémon no chão para capturar');
     // um clique por corpo: pula quem já foi clicado há menos de 3 s (o corpo fica na lista um tempo após a bola)
     const agora = Date.now();
-    const alvo = todos.find((a) => { const t = clicados.get(a.slot); return !t || agora - t > 3000; });
+    const alvo = todos.find((a) => {
+      const e = clicados.get(a.slot);
+      return !e || a.restante > e.w + 3;   // nunca clicado, ou corpo novo no mesmo slot (o 1º clique sempre lança a bola)
+    });
     if (!alvo) return;
 
     ultimoMotivo = '';
-    clicados.set(alvo.slot, agora);
+    clicados.set(alvo.slot, { t: agora, w: alvo.restante });
     stats.lancados++;
     alvo.el.click();
     total++;
@@ -292,6 +303,43 @@
     console.log('[clicker] desligado');
   };
 
+  // ---- exportar o HTML (para validar o mapa fora do jogo) ----
+  //   pkExportar()        -> baixa a página inteira
+  //   pkExportar('mapa')  -> abre o Mapa, baixa só o modal dele e fecha com Esc
+  window.pkExportar = async (alvo = 'pagina') => {
+    const baixar = (html, nome) => {
+      const url = URL.createObjectURL(new Blob([html], { type: 'text/html;charset=utf-8' }));
+      const a = Object.assign(document.createElement('a'), { href: url, download: nome });
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 5000);
+    };
+    const carimbo = new Date().toISOString().slice(0, 19).replace(/[-:T]/g, '');
+
+    if (alvo !== 'mapa') {
+      const html = '<!doctype html>\n' + document.documentElement.outerHTML;
+      baixar(html, `pokeidle-pagina-${carimbo}.html`);
+      aviso(`💾 Página exportada (${Math.round(html.length / 1024)} KB)`, '#22c55e');
+      return;
+    }
+
+    if (comprando) return aviso('⏳ Compra em andamento, tente de novo', '#fbbf24');
+    comprando = true;                             // bloqueia a compra automática enquanto o Mapa está aberto
+    try {
+      document.querySelector('button[data-modal="mapa"]')?.click();
+      await espera(1200);                         // deixa o mapa renderizar
+      const caixa = document.querySelector('#modal .modal-caixa[data-modal="mapa"]');
+      if (!caixa) return aviso('⚠️ Não consegui abrir o Mapa', '#ef4444');
+      const html = '<!doctype html>\n' + document.getElementById('modal').outerHTML;
+      baixar(html, `pokeidle-mapa-${carimbo}.html`);
+      aviso(`💾 Mapa exportado (${Math.round(html.length / 1024)} KB)`, '#22c55e');
+    } finally {
+      apertarEsc();
+      comprando = false;
+    }
+  };
+
   aviso(`✅ Clicker ligado (${INTERVALO_MS} ms)`);
-  console.log('[clicker] ligado. Para desativar, digite: pkParar()');
+  console.log('[clicker] ligado. Para desativar: pkParar() · Exportar HTML: pkExportar() ou pkExportar("mapa")');
 })();
